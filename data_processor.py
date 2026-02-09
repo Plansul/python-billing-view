@@ -66,6 +66,10 @@ def process_uploaded_xlsx(uploaded_file):
                 col_emissao = next(
                     (c for c in headers if c in ["EMISSÃO", "EMISSAO"]), None
                 )
+                col_cliente = next(
+                    (c for c in headers if c in ["CLIENTES", "NOME_CLIENTE"]),
+                    "CLIENTES",
+                )
 
                 data_df["DIA_FAT"] = df.iloc[header_row_idx + 1 :, 1].apply(
                     lambda x: pd.to_numeric(x, errors="coerce")
@@ -77,10 +81,22 @@ def process_uploaded_xlsx(uploaded_file):
                 data_df["DATA_EMISSAO"] = pd.to_datetime(
                     data_df[col_emissao], errors="coerce"
                 )
-                data_df["NOME_CLIENTE"] = data_df["CLIENTES"].astype(str)
+                data_df["NOME_CLIENTE"] = data_df[col_cliente].astype(str).str.strip()
                 data_df["SHEET_ORIGEM"] = sheet_name.strip()
+
+                # FILTROS: Clientes sem nome, linhas de "Total" e linhas com ambos valores zerados
+                data_df = data_df[
+                    data_df["NOME_CLIENTE"].notna()
+                    & (data_df["NOME_CLIENTE"].str.upper() != "NAN")
+                    & (data_df["NOME_CLIENTE"] != "")
+                    & (~data_df["NOME_CLIENTE"].str.contains("TOTAL", case=False))
+                    & ~(
+                        (data_df["VALOR_REALIZADO"] == 0)
+                        & (data_df["VALOR_PREVISAO"] == 0)
+                    )
+                ]
                 all_data.append(data_df)
-        return pd.concat(all_data).reset_index(drop=True)
+        return pd.concat(all_data).reset_index(drop=True) if all_data else None
     except:
         return None
 
@@ -91,37 +107,39 @@ def get_billing_metrics(df, selected_date):
     prev_month_end = start_cur - pd.Timedelta(days=1)
     start_prev = prev_month_end.replace(day=1)
     target_prev_day = start_prev + pd.Timedelta(days=selected_date.day - 1)
+
     if target_prev_day.month != start_prev.month:
         target_prev_day = prev_month_end
 
-    # 1. Acumulados MTD
     acc_now = df[
         (df["DATA_EMISSAO"] >= start_cur) & (df["DATA_EMISSAO"] <= selected_date)
     ]["VALOR_REALIZADO"].sum()
+
     acc_past = df[
         (df["DATA_EMISSAO"] >= start_prev) & (df["DATA_EMISSAO"] <= target_prev_day)
     ]["VALOR_REALIZADO"].sum()
 
-    # 2. Meta (Mês Anterior Completo)
     meta_total = df[
         (df["DATA_EMISSAO"].dt.month == start_prev.month)
         & (df["DATA_EMISSAO"].dt.year == start_prev.year)
     ]["VALOR_REALIZADO"].sum()
 
-    # 3. Séries para Gráfico
     df_c = (
         df[df["DATA_EMISSAO"].dt.month == selected_date.month]
-        .groupby("DATA_EMISSAO")["VALOR_REALIZADO"]
+        .groupby(df["DATA_EMISSAO"].dt.day)["VALOR_REALIZADO"]
         .sum()
+        .cumsum()
         .reset_index()
     )
+    df_c.columns = ["Dia", "ACUMULADO"]
+
     df_p = (
         df[df["DATA_EMISSAO"].dt.month == start_prev.month]
-        .groupby("DATA_EMISSAO")["VALOR_REALIZADO"]
+        .groupby(df["DATA_EMISSAO"].dt.day)["VALOR_REALIZADO"]
         .sum()
+        .cumsum()
         .reset_index()
     )
-    df_c["ACUMULADO"] = df_c["VALOR_REALIZADO"].cumsum()
-    df_p["ACUMULADO"] = df_p["VALOR_REALIZADO"].cumsum()
+    df_p.columns = ["Dia", "ACUMULADO"]
 
     return acc_now, acc_past, meta_total, df_c, df_p, target_prev_day
