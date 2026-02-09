@@ -1,5 +1,21 @@
 import pandas as pd
 import re
+import streamlit as st
+
+
+def standardize_client_name(name):
+    """
+    Padroniza o nome do cliente removendo sufixos após hífens ou parênteses.
+    Ex: 'TJ MG 11 - LIMP' -> 'TJ MG 11'
+    """
+    if not name or pd.isna(name):
+        return ""
+    name = str(name).upper()
+    # Remove tudo após hífens ou traços
+    name = re.split(r" [-–—]|[-–—]", name)[0]
+    # Remove parênteses e conteúdos internos
+    name = re.sub(r"\(.*\)", "", name)
+    return name.strip()
 
 
 def clean_currency(x):
@@ -81,13 +97,15 @@ def process_uploaded_xlsx(uploaded_file):
                 data_df["DATA_EMISSAO"] = pd.to_datetime(
                     data_df[col_emissao], errors="coerce"
                 )
-                data_df["NOME_CLIENTE"] = data_df[col_cliente].astype(str).str.strip()
+
+                # Normalização aqui
+                data_df["NOME_CLIENTE"] = data_df[col_cliente].apply(
+                    standardize_client_name
+                )
                 data_df["SHEET_ORIGEM"] = sheet_name.strip()
 
-                # FILTROS: Clientes sem nome, linhas de "Total" e linhas com ambos valores zerados
                 data_df = data_df[
                     data_df["NOME_CLIENTE"].notna()
-                    & (data_df["NOME_CLIENTE"].str.upper() != "NAN")
                     & (data_df["NOME_CLIENTE"] != "")
                     & (~data_df["NOME_CLIENTE"].str.contains("TOTAL", case=False))
                     & ~(
@@ -114,7 +132,6 @@ def get_billing_metrics(df, selected_date):
     acc_now = df[
         (df["DATA_EMISSAO"] >= start_cur) & (df["DATA_EMISSAO"] <= selected_date)
     ]["VALOR_REALIZADO"].sum()
-
     acc_past = df[
         (df["DATA_EMISSAO"] >= start_prev) & (df["DATA_EMISSAO"] <= target_prev_day)
     ]["VALOR_REALIZADO"].sum()
@@ -143,3 +160,24 @@ def get_billing_metrics(df, selected_date):
     df_p.columns = ["Dia", "ACUMULADO"]
 
     return acc_now, acc_past, meta_total, df_c, df_p, target_prev_day
+
+
+def get_inadimplencia_mensal(df):
+    """
+    Identifica falhas de faturamento comparando os meses (sheets) disponíveis.
+    """
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Cria tabela dinâmica: Clientes x Meses
+    pivot = df.pivot_table(
+        index="NOME_CLIENTE",
+        columns="SHEET_ORIGEM",
+        values="VALOR_REALIZADO",
+        aggfunc="sum",
+    ).fillna(0)
+
+    # Conta meses onde o faturamento realizado foi R$ 0,00
+    pivot["Meses Sem Faturar"] = (pivot == 0).sum(axis=1)
+
+    return pivot.sort_values(by="Meses Sem Faturar", ascending=False)

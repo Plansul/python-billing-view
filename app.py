@@ -2,12 +2,15 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from data_processor import process_uploaded_xlsx, get_billing_metrics
+from data_processor import (
+    process_uploaded_xlsx,
+    get_billing_metrics,
+    get_inadimplencia_mensal,
+)
 
 st.set_page_config(layout="wide", page_title="BI Faturamento", page_icon="📈")
 
 
-# Função auxiliar para formatar moeda no padrão BR
 def format_br(val):
     return f"R$ {val:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
@@ -21,13 +24,11 @@ if file:
     df_raw = process_uploaded_xlsx(file)
 
     if df_raw is not None and not df_raw.empty:
-        # Atualiza opções do filtro com dados da planilha
         clientes_lista = sorted(df_raw["NOME_CLIENTE"].unique())
         f_clientes = st.sidebar.multiselect(
             "Filtrar Clientes", options=clientes_lista, key="filtro_cli"
         )
 
-        # Aplica o filtro de clientes se houver seleção
         df_filtered = df_raw.copy()
         if f_clientes:
             df_filtered = df_filtered[df_filtered["NOME_CLIENTE"].isin(f_clientes)]
@@ -51,7 +52,6 @@ if file:
 
         # --- LINHA 2: METAS E SAÚDE ---
         st.subheader("🎯 Metas e Alertas Operacionais")
-
         meses_nomes = [
             "Janeiro",
             "Fevereiro",
@@ -68,10 +68,16 @@ if file:
         ]
         sheet_ref = f"{meses_nomes[sel_date.month-1]} {sel_date.year}"
 
-        # Filtra para a aba do mês atual selecionado
         df_mes_atual = df_filtered[
             df_filtered["SHEET_ORIGEM"].str.upper() == sheet_ref.upper()
         ].copy()
+
+        # Agrupamento para consolidar clientes normalizados no mês atual
+        df_agrupado = (
+            df_mes_atual.groupby("NOME_CLIENTE")
+            .agg({"VALOR_REALIZADO": "sum", "VALOR_PREVISAO": "sum", "DIA_FAT": "min"})
+            .reset_index()
+        )
 
         def check_status(row, day):
             if row["VALOR_REALIZADO"] > 0:
@@ -80,28 +86,25 @@ if file:
                 return "⚪ S/ Janela"
             return "🚨 Atrasado" if row["DIA_FAT"] < day else "⏳ No Prazo"
 
-        df_mes_atual["STATUS"] = df_mes_atual.apply(
+        df_agrupado["STATUS"] = df_agrupado.apply(
             lambda r: check_status(r, sel_date.day), axis=1
         )
-        df_operacional = df_mes_atual[df_mes_atual["STATUS"] != "⚪ S/ Janela"].copy()
+        df_operacional = df_agrupado[df_agrupado["STATUS"] != "⚪ S/ Janela"].copy()
 
         atrasados_count = len(df_operacional[df_operacional["STATUS"] == "🚨 Atrasado"])
         progresso_pct = (acc_now / meta_total * 100) if meta_total > 0 else 0
 
         m1, m2, m3 = st.columns(3)
-
         with m1:
             st.metric("Alvo (Total Mês Ant.)", format_br(meta_total))
             st.write(f"**Progresso: {progresso_pct:.1f}%**")
             st.progress(min(progresso_pct / 100, 1.0))
-
         with m2:
             st.metric("% Atingido da Meta", f"{progresso_pct:.1f}%")
             fig_pizza = go.Figure(
                 data=[
                     go.Pie(
                         values=[acc_now, max(0, meta_total - acc_now)],
-                        labels=["Realizado", "Falta"],
                         hole=0.7,
                         marker_colors=["#2E7D32", "#e0e0e0"],
                         textinfo="none",
@@ -114,11 +117,9 @@ if file:
                 height=80,
                 paper_bgcolor="rgba(0,0,0,0)",
             )
-            # AJUSTE 1: replace use_container_width with width='stretch'
             st.plotly_chart(
                 fig_pizza, width="stretch", config={"displayModeBar": False}
             )
-
         with m3:
             st.metric(
                 "Atrasos Críticos",
@@ -131,17 +132,12 @@ if file:
 
         # --- LINHA 3: GRÁFICO E TABELA ---
         col_grafico, col_tabela = st.columns([1.2, 0.8])
-
         with col_grafico:
             st.write("**📈 Trajetória de Faturamento Acumulado**")
             d_c = df_c[df_c["Dia"] <= sel_date.day].copy()
             d_p = df_p[df_p["Dia"] <= sel_date.day].copy()
-
             plot_df = pd.concat(
-                [
-                    d_c.assign(Legenda="Mês Atual"),
-                    d_p.assign(Legenda="Mês Anterior"),
-                ]
+                [d_c.assign(Legenda="Mês Atual"), d_p.assign(Legenda="Mês Anterior")]
             )
             fig = px.line(
                 plot_df,
@@ -155,12 +151,10 @@ if file:
                 margin=dict(l=0, r=0, t=20, b=0),
                 legend=dict(orientation="h", y=1.02, x=1, xanchor="right"),
             )
-            # AJUSTE 1: replace use_container_width with width='stretch'
             st.plotly_chart(fig, width="stretch")
 
         with col_tabela:
-            st.write("**📋 Clientes (Ordenado por Valor)**")
-            # Ordenação por Valor Realizado Crescente
+            st.write("**📋 Clientes Consolidados (Ordenado por Valor)**")
             df_tabela_final = df_operacional[
                 [
                     "DIA_FAT",
@@ -170,8 +164,6 @@ if file:
                     "STATUS",
                 ]
             ].sort_values(by="VALOR_REALIZADO", ascending=True)
-
-            # AJUSTE 3: Formatação do DIA_FAT para inteiro
             st.dataframe(
                 df_tabela_final.style.format(
                     {
@@ -187,9 +179,42 @@ if file:
                     ),
                     subset=["STATUS"],
                 ),
-                width="stretch",  # AJUSTE 1: replace use_container_width with width='stretch'
+                width="stretch",
                 height=400,
                 hide_index=True,
             )
-    else:
-        st.info("Aguardando upload.")
+
+        st.divider()
+
+        # --- NOVA FEATURE: ANÁLISE DE INADIMPLÊNCIA MENSAL ---
+        st.subheader("Análise de Inadimplência e Frequência Mensal")
+        st.write("Visão histórica de meses sem faturamento realizado por entidade.")
+
+        df_inad_history = get_inadimplencia_mensal(df_filtered)
+
+        if not df_inad_history.empty:
+            df_inad_display = df_inad_history[df_inad_history["Meses Sem Faturar"] > 0]
+
+            def style_inad(val):
+                if val == 0:
+                    return "background-color: #F8D7DA; color: #721C24;"  # Vermelho
+                return "background-color: #D4EDDA; color: #155724;"  # Verde
+
+            meses_cols = [
+                c for c in df_inad_display.columns if c != "Meses Sem Faturar"
+            ]
+
+            st.dataframe(
+                df_inad_display.style.format(format_br, subset=meses_cols)
+                .map(style_inad, subset=meses_cols)
+                .background_gradient(cmap="Reds", subset=["Meses Sem Faturar"]),
+                width="stretch",
+                height=400,
+            )
+            st.caption(
+                "💡 **Legenda:** Células em vermelho representam meses com faturamento zero. A coluna da direita destaca a frequência total de falhas."
+            )
+        else:
+            st.info("Dados insuficientes para gerar histórico.")
+else:
+    st.info("Aguardando upload.")
