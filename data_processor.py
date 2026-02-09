@@ -44,7 +44,6 @@ def process_uploaded_xlsx(uploaded_file):
         for sheet_name in xl.sheet_names:
             if not pattern.match(sheet_name.strip()):
                 continue
-
             df = pd.read_excel(xl, sheet_name=sheet_name, header=None)
             header_row_idx = None
             for i, row in df.iterrows():
@@ -54,8 +53,7 @@ def process_uploaded_xlsx(uploaded_file):
                     break
 
             if header_row_idx is not None:
-                raw_headers = df.iloc[header_row_idx].values
-                headers = make_headers_unique(raw_headers)
+                headers = make_headers_unique(df.iloc[header_row_idx].values)
                 data_df = df.iloc[header_row_idx + 1 :].copy()
                 data_df.columns = headers
 
@@ -68,7 +66,6 @@ def process_uploaded_xlsx(uploaded_file):
                 col_emissao = next(
                     (c for c in headers if c in ["EMISSÃO", "EMISSAO"]), None
                 )
-                col_clientes = "CLIENTES"
 
                 data_df["DIA_FAT"] = df.iloc[header_row_idx + 1 :, 1].apply(
                     lambda x: pd.to_numeric(x, errors="coerce")
@@ -80,72 +77,38 @@ def process_uploaded_xlsx(uploaded_file):
                 data_df["DATA_EMISSAO"] = pd.to_datetime(
                     data_df[col_emissao], errors="coerce"
                 )
-                data_df["NOME_CLIENTE"] = data_df[col_clientes].astype(str)
+                data_df["NOME_CLIENTE"] = data_df["CLIENTES"].astype(str)
                 data_df["SHEET_ORIGEM"] = sheet_name.strip()
-
-                data_df = data_df[
-                    data_df["NOME_CLIENTE"].notna() & (data_df["NOME_CLIENTE"] != "nan")
-                ]
                 all_data.append(data_df)
-
-        return pd.concat(all_data).reset_index(drop=True) if all_data else None
-    except Exception as e:
-        print(f"Erro no processamento: {e}")
+        return pd.concat(all_data).reset_index(drop=True)
+    except:
         return None
 
 
 def get_billing_metrics(df, selected_date):
     selected_date = pd.Timestamp(selected_date).normalize()
     start_cur = selected_date.replace(day=1)
-
     prev_month_end = start_cur - pd.Timedelta(days=1)
     start_prev = prev_month_end.replace(day=1)
     target_prev_day = start_prev + pd.Timedelta(days=selected_date.day - 1)
     if target_prev_day.month != start_prev.month:
         target_prev_day = prev_month_end
 
-    # 1. Acumulado Mês Atual (MTD)
+    # 1. Acumulados MTD
     acc_now = df[
         (df["DATA_EMISSAO"] >= start_cur) & (df["DATA_EMISSAO"] <= selected_date)
     ]["VALOR_REALIZADO"].sum()
-
-    # 2. Acumulado Mês Anterior (Mesmo período)
     acc_past = df[
         (df["DATA_EMISSAO"] >= start_prev) & (df["DATA_EMISSAO"] <= target_prev_day)
     ]["VALOR_REALIZADO"].sum()
 
-    # 3. Total Fechado Mês Anterior (Meta)
-    total_full_past = df[
+    # 2. Meta (Mês Anterior Completo)
+    meta_total = df[
         (df["DATA_EMISSAO"].dt.month == start_prev.month)
         & (df["DATA_EMISSAO"].dt.year == start_prev.year)
     ]["VALOR_REALIZADO"].sum()
 
-    # 4. Contagem de Clientes Atrasados (Lógica Coluna B)
-    # Filtramos apenas os registros do mês de referência (sheet_origem)
-    meses_nomes = [
-        "Janeiro",
-        "Fevereiro",
-        "Março",
-        "Abril",
-        "Maio",
-        "Junho",
-        "Julho",
-        "Agosto",
-        "Setembro",
-        "Outubro",
-        "Novembro",
-        "Dezembro",
-    ]
-    sheet_ref = f"{meses_nomes[selected_date.month-1]} {selected_date.year}"
-
-    df_mes = df[df["SHEET_ORIGEM"].str.upper() == sheet_ref.upper()].copy()
-    atrasados_count = len(
-        df_mes[
-            (df_mes["VALOR_REALIZADO"] <= 0) & (df_mes["DIA_FAT"] < selected_date.day)
-        ]
-    )
-
-    # Séries para gráficos
+    # 3. Séries para Gráfico
     df_c = (
         df[df["DATA_EMISSAO"].dt.month == selected_date.month]
         .groupby("DATA_EMISSAO")["VALOR_REALIZADO"]
@@ -161,12 +124,4 @@ def get_billing_metrics(df, selected_date):
     df_c["ACUMULADO"] = df_c["VALOR_REALIZADO"].cumsum()
     df_p["ACUMULADO"] = df_p["VALOR_REALIZADO"].cumsum()
 
-    return (
-        acc_now,
-        acc_past,
-        total_full_past,
-        atrasados_count,
-        df_c,
-        df_p,
-        target_prev_day,
-    )
+    return acc_now, acc_past, meta_total, df_c, df_p, target_prev_day
