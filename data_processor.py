@@ -1,8 +1,9 @@
 import pandas as pd
+import re
 
 
 def clean_currency(x):
-    if pd.isna(x) or x == "":
+    if pd.isna(x) or x == "" or str(x).strip() == "-":
         return 0.0
     if isinstance(x, (int, float)):
         return float(x)
@@ -17,70 +18,155 @@ def clean_currency(x):
         return 0.0
 
 
+def make_headers_unique(headers):
+    seen = {}
+    unique_headers = []
+    for h in headers:
+        h_str = str(h).strip().upper()
+        if h_str in seen:
+            seen[h_str] += 1
+            unique_headers.append(f"{h_str}_{seen[h_str]}")
+        else:
+            seen[h_str] = 0
+            unique_headers.append(h_str)
+    return unique_headers
+
+
 def process_uploaded_xlsx(uploaded_file):
     try:
         xl = pd.ExcelFile(uploaded_file)
         all_data = []
+        pattern = re.compile(
+            r"^(Janeiro|Fevereiro|Março|Abril|Maio|Junho|Julho|Agosto|Setembro|Outubro|Novembro|Dezembro)\s\d{4}$",
+            re.IGNORECASE,
+        )
+
         for sheet_name in xl.sheet_names:
-            if not any(char.isdigit() for char in sheet_name):
-                continue
-            if any(w in sheet_name.upper() for w in ["PENDÊNCIAS", "INADIMPLENTES"]):
+            if not pattern.match(sheet_name.strip()):
                 continue
 
             df = pd.read_excel(xl, sheet_name=sheet_name, header=None)
-            header_row = None
+            header_row_idx = None
             for i, row in df.iterrows():
-                row_vals = [str(v).strip().upper() for v in row.values]
-                if "EMISSÃO" in row_vals and "VLR BRUTO" in row_vals:
-                    header_row = i
+                row_str = [str(val).strip().upper() for val in row.values]
+                if "VLR BRUTO" in row_str and "EMISSÃO" in row_str:
+                    header_row_idx = i
                     break
 
-            if header_row is not None:
-                df_final = df.iloc[header_row + 1 :].copy()
-                df_final.columns = [
-                    str(c).strip().upper() for c in df.iloc[header_row].values
+            if header_row_idx is not None:
+                raw_headers = df.iloc[header_row_idx].values
+                headers = make_headers_unique(raw_headers)
+                data_df = df.iloc[header_row_idx + 1 :].copy()
+                data_df.columns = headers
+
+                col_bruto = next(
+                    (c for c in headers if c in ["VLR BRUTO", "VALOR BRUTO"]), None
+                )
+                col_prev = next(
+                    (c for c in headers if c in ["PREVISÃO", "PREVISAO"]), None
+                )
+                col_emissao = next(
+                    (c for c in headers if c in ["EMISSÃO", "EMISSAO"]), None
+                )
+                col_clientes = "CLIENTES"
+
+                data_df["DIA_FAT"] = df.iloc[header_row_idx + 1 :, 1].apply(
+                    lambda x: pd.to_numeric(x, errors="coerce")
+                )
+                data_df["VALOR_REALIZADO"] = data_df[col_bruto].apply(clean_currency)
+                data_df["VALOR_PREVISAO"] = (
+                    data_df[col_prev].apply(clean_currency) if col_prev else 0.0
+                )
+                data_df["DATA_EMISSAO"] = pd.to_datetime(
+                    data_df[col_emissao], errors="coerce"
+                )
+                data_df["NOME_CLIENTE"] = data_df[col_clientes].astype(str)
+                data_df["SHEET_ORIGEM"] = sheet_name.strip()
+
+                data_df = data_df[
+                    data_df["NOME_CLIENTE"].notna() & (data_df["NOME_CLIENTE"] != "nan")
                 ]
-                df_final["VALOR"] = df_final["VLR BRUTO"].apply(clean_currency)
-                df_final["DATA"] = pd.to_datetime(df_final["EMISSÃO"], errors="coerce")
+                all_data.append(data_df)
 
-                clean_df = df_final.dropna(subset=["DATA", "VALOR"])
-                clean_df = clean_df[clean_df["VALOR"] > 0]
-                all_data.append(clean_df[["DATA", "VALOR"]])
-
-        if not all_data:
-            return None
-        return (
-            pd.concat(all_data)
-            .groupby("DATA")["VALOR"]
-            .sum()
-            .reset_index()
-            .sort_values("DATA")
-        )
-    except:
+        return pd.concat(all_data).reset_index(drop=True) if all_data else None
+    except Exception as e:
+        print(f"Erro no processamento: {e}")
         return None
 
 
-def get_cumulative_metrics(df, selected_date):
+def get_billing_metrics(df, selected_date):
     selected_date = pd.Timestamp(selected_date).normalize()
     start_cur = selected_date.replace(day=1)
+
     prev_month_end = start_cur - pd.Timedelta(days=1)
     start_prev = prev_month_end.replace(day=1)
-
     target_prev_day = start_prev + pd.Timedelta(days=selected_date.day - 1)
     if target_prev_day.month != start_prev.month:
         target_prev_day = prev_month_end
 
-    acc_now = df[(df["DATA"] >= start_cur) & (df["DATA"] <= selected_date)][
-        "VALOR"
-    ].sum()
-    acc_past = df[(df["DATA"] >= start_prev) & (df["DATA"] <= target_prev_day)][
-        "VALOR"
-    ].sum()
+    # 1. Acumulado Mês Atual (MTD)
+    acc_now = df[
+        (df["DATA_EMISSAO"] >= start_cur) & (df["DATA_EMISSAO"] <= selected_date)
+    ]["VALOR_REALIZADO"].sum()
 
-    df_c = df[df["DATA"].dt.month == selected_date.month].copy().sort_values("DATA")
-    df_p = df[df["DATA"].dt.month == start_prev.month].copy().sort_values("DATA")
+    # 2. Acumulado Mês Anterior (Mesmo período)
+    acc_past = df[
+        (df["DATA_EMISSAO"] >= start_prev) & (df["DATA_EMISSAO"] <= target_prev_day)
+    ]["VALOR_REALIZADO"].sum()
 
-    df_c["ACUMULADO"] = df_c["VALOR"].cumsum()
-    df_p["ACUMULADO"] = df_p["VALOR"].cumsum()
+    # 3. Total Fechado Mês Anterior (Meta)
+    total_full_past = df[
+        (df["DATA_EMISSAO"].dt.month == start_prev.month)
+        & (df["DATA_EMISSAO"].dt.year == start_prev.year)
+    ]["VALOR_REALIZADO"].sum()
 
-    return acc_now, acc_past, df_c, df_p, target_prev_day
+    # 4. Contagem de Clientes Atrasados (Lógica Coluna B)
+    # Filtramos apenas os registros do mês de referência (sheet_origem)
+    meses_nomes = [
+        "Janeiro",
+        "Fevereiro",
+        "Março",
+        "Abril",
+        "Maio",
+        "Junho",
+        "Julho",
+        "Agosto",
+        "Setembro",
+        "Outubro",
+        "Novembro",
+        "Dezembro",
+    ]
+    sheet_ref = f"{meses_nomes[selected_date.month-1]} {selected_date.year}"
+
+    df_mes = df[df["SHEET_ORIGEM"].str.upper() == sheet_ref.upper()].copy()
+    atrasados_count = len(
+        df_mes[
+            (df_mes["VALOR_REALIZADO"] <= 0) & (df_mes["DIA_FAT"] < selected_date.day)
+        ]
+    )
+
+    # Séries para gráficos
+    df_c = (
+        df[df["DATA_EMISSAO"].dt.month == selected_date.month]
+        .groupby("DATA_EMISSAO")["VALOR_REALIZADO"]
+        .sum()
+        .reset_index()
+    )
+    df_p = (
+        df[df["DATA_EMISSAO"].dt.month == start_prev.month]
+        .groupby("DATA_EMISSAO")["VALOR_REALIZADO"]
+        .sum()
+        .reset_index()
+    )
+    df_c["ACUMULADO"] = df_c["VALOR_REALIZADO"].cumsum()
+    df_p["ACUMULADO"] = df_p["VALOR_REALIZADO"].cumsum()
+
+    return (
+        acc_now,
+        acc_past,
+        total_full_past,
+        atrasados_count,
+        df_c,
+        df_p,
+        target_prev_day,
+    )
